@@ -16,6 +16,10 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
+from linkedin_mcp_server.approva.comment import (
+    CommentError,
+    create_comment as comment_create,
+)
 from linkedin_mcp_server.approva.composer import (
     ComposerError,
     create_post as composer_create_post,
@@ -61,16 +65,22 @@ def register_approva_tools(
     @mcp.tool(
         timeout=tool_timeout,
         title="Create or Schedule a LinkedIn Post",
-        annotations={"readOnlyHint": False, "destructiveHint": True,
-                     "openWorldHint": True},
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+        },
         tags={"approva", "post", "write"},
         exclude_args=["extractor"],
     )
     async def create_post(
         text: Annotated[
             str,
-            Field(description="The post body, exactly as it should appear.",
-                  min_length=1, max_length=3000),
+            Field(
+                description="The post body, exactly as it should appear.",
+                min_length=1,
+                max_length=3000,
+            ),
         ],
         ctx: Context,
         image_paths: Annotated[
@@ -79,11 +89,13 @@ def register_approva_tools(
         ] = None,
         schedule_at: Annotated[
             str | None,
-            Field(description=(
-                "Local ISO-8601 time to schedule for, e.g. '2026-09-02T08:30'. "
-                "Must be >=10 minutes ahead and on a 5-minute boundary. "
-                "Omit to publish immediately."
-            )),
+            Field(
+                description=(
+                    "Local ISO-8601 time to schedule for, e.g. '2026-09-02T08:30'. "
+                    "Must be >=10 minutes ahead and on a 5-minute boundary. "
+                    "Omit to publish immediately."
+                )
+            ),
         ] = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
@@ -101,8 +113,11 @@ def register_approva_tools(
 
         Returns:
             Dict with status ("posted" or "scheduled"), submitted,
-            composer_closed, characters, images_attached, scheduled_for, and
-            page_state ("normal" | "login" | "challenge").
+            composer_closed, post_url, characters, images_attached,
+            scheduled_for, and page_state ("normal" | "login" | "challenge").
+            post_url is the published post's permalink, and is null for a
+            scheduled post (LinkedIn holds it, so there is nothing to link to
+            yet) or when the permalink could not be identified unambiguously.
         """
         try:
             raise_if_stopped("create_post")
@@ -118,9 +133,7 @@ def register_approva_tools(
                 len(image_paths or []),
                 schedule_at,
             )
-            await ctx.report_progress(
-                progress=0, total=100, message="Opening composer"
-            )
+            await ctx.report_progress(progress=0, total=100, message="Opening composer")
 
             result = await composer_create_post(
                 page,
@@ -135,9 +148,7 @@ def register_approva_tools(
             if state != "normal":
                 # The post may or may not have landed; either way the account
                 # is in a state no further automation should touch.
-                set_stop(
-                    f"create_post saw page_state={state} at {result.get('url')}"
-                )
+                set_stop(f"create_post saw page_state={state} at {result.get('url')}")
 
             await ctx.report_progress(progress=100, total=100, message="Complete")
             return result
@@ -199,6 +210,91 @@ def register_approva_tools(
         except Exception as e:
             raise_tool_error(e, "inspect_composer")  # NoReturn
 
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Comment on a LinkedIn Post",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+        },
+        tags={"approva", "post", "write"},
+        exclude_args=["extractor"],
+    )
+    async def approva_comment(
+        post_url: Annotated[
+            str,
+            Field(
+                description=(
+                    "Permalink of the post to comment on: a '/feed/update/' or "
+                    "'/posts/' LinkedIn URL, or a bare 'urn:li:activity:...'."
+                )
+            ),
+        ],
+        text: Annotated[
+            str,
+            Field(
+                description="The comment, exactly as it should appear.",
+                min_length=1,
+                max_length=1250,
+            ),
+        ],
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Comment on a LinkedIn post as the authenticated member.
+
+        Confirms the comment rendered on the post before reporting success: a
+        submit that does not appear is returned as an error, never as a
+        success, because a blind retry is what double-posts.
+
+        Refuses while the Approva kill switch file exists. Sets the kill
+        switch automatically if LinkedIn shows a login or challenge page after
+        the action.
+
+        Returns:
+            Dict with ok, post_url, comment_urn, comment_url, characters,
+            editor_cleared, submitted_via, and page_state
+            ("normal" | "login" | "challenge").
+        """
+        try:
+            raise_if_stopped("approva_comment")
+
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="approva_comment"
+            )
+            page, goto = _page_and_goto(extractor)
+
+            logger.info("approva_comment: %d chars on %s", len(text), post_url)
+            await ctx.report_progress(progress=0, total=100, message="Opening post")
+
+            result = await comment_create(page, goto, post_url=post_url, text=text)
+
+            state = await read_page_state(page)
+            result["page_state"] = state
+            if state != "normal":
+                set_stop(
+                    f"approva_comment saw page_state={state} at {result.get('url')}"
+                )
+
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+            return result
+
+        except StopFileError as e:
+            raise ToolError(str(e)) from e
+        except CommentError as e:
+            raise ToolError(str(e)) from e
+        except ToolError:
+            raise
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "approva_comment")
+        except Exception as e:
+            raise_tool_error(e, "approva_comment")  # NoReturn
+
     register_approva_write_wrappers(mcp, tool_timeout=tool_timeout)
 
 
@@ -222,8 +318,11 @@ def register_approva_write_wrappers(
     @mcp.tool(
         timeout=tool_timeout,
         title="Send a Connection Request (guarded)",
-        annotations={"readOnlyHint": False, "destructiveHint": True,
-                     "openWorldHint": True},
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+        },
         tags={"approva", "person", "write"},
         exclude_args=["extractor"],
     )
@@ -234,8 +333,11 @@ def register_approva_write_wrappers(
         ctx: Context,
         note: Annotated[
             str | None,
-            Field(description="Optional invite note, at most 300 characters.",
-                  max_length=300),
+            # Deliberately no ``max_length``: a schema constraint here is
+            # enforced by pydantic before the body runs, so the explicit
+            # refusal below -- which names the actual length and the limit --
+            # was unreachable and the caller saw a bare validation error.
+            Field(description="Optional invite note, at most 300 characters."),
         ] = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
@@ -246,8 +348,13 @@ def register_approva_write_wrappers(
         pending and follow-only states before it will write anything.
 
         Returns:
-            Upstream's connect result plus page_state
-            ("normal" | "login" | "challenge").
+            Dict with url, status, message, note_sent, and page_state
+            ("normal" | "login" | "challenge"). status is one of connected,
+            already_connected, pending, accepted, connect_unavailable,
+            custom_note_limit_reached, send_failed, unavailable. note_sent
+            reports delivery, not that the note was typed: a Premium note
+            quota block returns custom_note_limit_reached with nothing sent
+            at all -- not an invite without a note.
         """
         try:
             raise_if_stopped("approva_connect")
@@ -261,9 +368,12 @@ def register_approva_write_wrappers(
             )
             page, _ = _page_and_goto(extractor)
 
-            result = await extractor.connect_with_person(
-                linkedin_username, note=note
-            )
+            result = await extractor.connect_with_person(linkedin_username, note=note)
+            # Upstream returns the full profile text it scraped on the way in.
+            # A write does not need to hand back a page scrape, and the bot
+            # stores what it gets; callers wanting the profile have
+            # get_person_profile.
+            result.pop("profile", None)
 
             state = await read_page_state(page)
             result["page_state"] = state
@@ -286,8 +396,11 @@ def register_approva_write_wrappers(
     @mcp.tool(
         timeout=tool_timeout,
         title="Send a Direct Message (guarded)",
-        annotations={"readOnlyHint": False, "destructiveHint": True,
-                     "openWorldHint": True},
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+        },
         tags={"approva", "messaging", "write"},
         exclude_args=["extractor"],
     )
