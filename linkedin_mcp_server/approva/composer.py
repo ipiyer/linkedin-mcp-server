@@ -46,17 +46,31 @@ class ComposerError(RuntimeError):
 # --------------------------------------------------------------------------
 
 
+# Shared by every evaluate in this package: an element is present if it
+# occupies space. Declared once so the composer and the comment box cannot
+# drift apart on what "visible" means.
+VISIBLE_JS = """
+    const visible = (el) => !!(el.offsetWidth || el.offsetHeight
+                               || el.getClientRects().length);
+"""
+
+# An expression rather than a statement block, so it can be dropped into any
+# evaluate that already has ``visible`` in scope -- which is what lets the
+# comment box share the focus and read-back helpers below.
+COMPOSER_EDITOR_JS = """Array.from(document.querySelectorAll(
+        '[role="textbox"][contenteditable], [role="textbox"], [contenteditable="true"]'
+    )).find(visible)"""
+
 # The composer is not a role="dialog" -- LinkedIn renders it as a plain
 # overlay -- so it cannot be scoped by role. It is located instead from its
 # editor, a TipTap/ProseMirror contenteditable, by walking up a fixed number
 # of levels to the overlay that holds the action bar. Class names are never
 # matched: LinkedIn's are hashed and rotate.
-_COMPOSER_ROOT_JS = """
-    const visible = (el) => !!(el.offsetWidth || el.offsetHeight
-                               || el.getClientRects().length);
-    const editor = Array.from(document.querySelectorAll(
-        '[role="textbox"][contenteditable], [role="textbox"], [contenteditable="true"]'
-    )).find(visible);
+_COMPOSER_ROOT_JS = (
+    VISIBLE_JS
+    + "    const editor = "
+    + COMPOSER_EDITOR_JS
+    + """;
     let composerRoot = null;
     if (editor) {
         composerRoot = editor;
@@ -64,13 +78,58 @@ _COMPOSER_ROOT_JS = """
             composerRoot = composerRoot.parentElement;
     }
 """
+)
+
+
+async def focus_contenteditable(page: Any, element_js: str) -> bool:
+    """Focus the contenteditable ``element_js`` selects, without an
+    actionability check.
+
+    ``element_js`` is a JavaScript *expression*, evaluated with ``visible``
+    in scope, returning an element or null. Both of LinkedIn's editors -- the
+    post composer and the comment box -- are React-hydrated contenteditables
+    that build their document from real key events, so text has to be typed
+    into a focused element rather than assigned, and patchright's
+    actionability checks time out against both. Parameterising the element is
+    what lets one implementation serve both.
+    """
+    return await page.evaluate(
+        "() => {"
+        + VISIBLE_JS
+        + "    const editor = ("
+        + element_js
+        + """);
+            if (!editor) return false;
+            editor.focus();
+            const sel = window.getSelection();
+            if (sel && editor.lastChild) {
+                const range = document.createRange();
+                range.selectNodeContents(editor);
+                range.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+            return document.activeElement === editor
+                || editor.contains(document.activeElement);
+        }"""
+    )
+
+
+async def read_contenteditable(page: Any, element_js: str) -> str:
+    """Read back what an editor contains, to verify the typing landed."""
+    text = await page.evaluate(
+        "() => {"
+        + VISIBLE_JS
+        + "    const editor = ("
+        + element_js
+        + "); return editor ? (editor.innerText || '') : ''; }"
+    )
+    return text if isinstance(text, str) else ""
 
 
 async def _find_editor(page: Any) -> bool:
     """Report whether a visible composer editor is on the page."""
-    return await page.evaluate(
-        "() => {" + _COMPOSER_ROOT_JS + " return !!editor; }"
-    )
+    return await page.evaluate("() => {" + _COMPOSER_ROOT_JS + " return !!editor; }")
 
 
 async def _click_by_text(
@@ -88,7 +147,9 @@ async def _click_by_text(
     return await page.evaluate(
         """
         ([candidates, scoped]) => {
-        """ + _COMPOSER_ROOT_JS + """
+        """
+        + _COMPOSER_ROOT_JS
+        + """
             const root = (scoped && composerRoot) ? composerRoot : document;
             const controls = Array.from(
                 root.querySelectorAll('button, a, [role="button"], [role="menuitem"]')
@@ -127,35 +188,13 @@ async def _wait_for_composer(page: Any, *, timeout: float = 12.0) -> bool:
 
 
 async def _focus_editor(page: Any) -> bool:
-    """Focus the composer's editor without an actionability check.
-
-    ProseMirror only builds its document from real key events, so the text has
-    to be typed into a focused element rather than assigned.
-    """
-    return await page.evaluate(
-        "() => {" + _COMPOSER_ROOT_JS + """
-            if (!editor) return false;
-            editor.focus();
-            const sel = window.getSelection();
-            if (sel && editor.lastChild) {
-                const range = document.createRange();
-                range.selectNodeContents(editor);
-                range.collapse(false);
-                sel.removeAllRanges();
-                sel.addRange(range);
-            }
-            return document.activeElement === editor
-                || editor.contains(document.activeElement);
-        }"""
-    )
+    """Focus the composer's editor without an actionability check."""
+    return await focus_contenteditable(page, COMPOSER_EDITOR_JS)
 
 
 async def _editor_text(page: Any) -> str:
-    """Read back what the editor contains, to verify the typing landed."""
-    text = await page.evaluate(
-        "() => {" + _COMPOSER_ROOT_JS + " return editor ? (editor.innerText || '') : ''; }"
-    )
-    return text if isinstance(text, str) else ""
+    """Read back what the composer's editor contains."""
+    return await read_contenteditable(page, COMPOSER_EDITOR_JS)
 
 
 # --------------------------------------------------------------------------
@@ -256,8 +295,9 @@ async def inspect_composer(page: Any, goto: Any) -> dict[str, Any]:
         scoped=False,
     )
     await asyncio.sleep(1.2)
-    after_expand = await scan("expanded") if expanded else {"phase": "expanded",
-                                                            "buttons": []}
+    after_expand = (
+        await scan("expanded") if expanded else {"phase": "expanded", "buttons": []}
+    )
 
     # Decisive check: is a scheduling affordance anywhere on the page at all?
     schedule_hunt = await page.evaluate(
@@ -336,14 +376,10 @@ async def inspect_composer(page: Any, goto: Any) -> dict[str, Any]:
 async def _dismiss_composer(page: Any) -> None:
     """Close the composer, discarding any draft, without posting."""
     try:
-        await _click_by_text(
-            page, ["aria:dismiss", "aria:close"], scoped=True
-        )
+        await _click_by_text(page, ["aria:dismiss", "aria:close"], scoped=True)
         await asyncio.sleep(0.6)
         # LinkedIn asks whether to save a draft when there is text.
-        await _click_by_text(
-            page, ["text:discard", "aria:discard"], scoped=True
-        )
+        await _click_by_text(page, ["text:discard", "aria:discard"], scoped=True)
         await asyncio.sleep(0.4)
     except Exception:
         logger.debug("Composer dismiss failed; continuing", exc_info=True)
@@ -437,9 +473,7 @@ async def _attach_images(page: Any, images: list[Path]) -> None:
 
     file_input = page.locator('input[type="file"]').first
     try:
-        await file_input.set_input_files(
-            [str(p) for p in images], timeout=15000
-        )
+        await file_input.set_input_files([str(p) for p in images], timeout=15000)
     except Exception as exc:  # noqa: BLE001 - reported to the caller as status
         raise ComposerError(
             f"Could not hand {len(images)} image(s) to LinkedIn's file input: {exc}"
@@ -547,6 +581,119 @@ async def _apply_schedule(page: Any, when: dt.datetime) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+# The attribute used to identify the composer's own editor across a submit.
+# React re-renders freely, so the element has to be tagged rather than
+# re-found: "is *this* element still here" is a different question from "is
+# an editor still here", and only the first one answers whether the composer
+# we typed into closed.
+_EDITOR_MARK = "data-approva-editor"
+
+# LinkedIn's permalinks. Matched by URL shape rather than by the link's text,
+# which is locale-dependent; an href pattern is not.
+_PERMALINK_SELECTOR = 'a[href*="/feed/update/urn:li:activity:"]'
+
+
+async def _mark_editor(page: Any) -> bool:
+    """Tag the editor we are about to type into, so it can be found again."""
+    return await page.evaluate(
+        "(attr) => {"
+        + VISIBLE_JS
+        + "    const editor = "
+        + COMPOSER_EDITOR_JS
+        + """;
+            if (!editor) return false;
+            editor.setAttribute(attr, '1');
+            return true;
+        }""",
+        _EDITOR_MARK,
+    )
+
+
+async def _editor_still_open(page: Any) -> bool:
+    """Report whether the editor we typed into is still on the page.
+
+    Asked of the tagged element, never of ``div[role="dialog"]``: the composer
+    is not a dialog (``50872b7``), so that selector never matched and the
+    old check reported "closed" whether or not the post went through.
+    """
+    return await page.evaluate(
+        "(attr) => {"
+        + VISIBLE_JS
+        + """
+            const el = document.querySelector('[' + attr + ']');
+            return !!(el && visible(el));
+        }""",
+        _EDITOR_MARK,
+    )
+
+
+async def _permalinks(page: Any) -> list[str]:
+    """Every post permalink currently linked from the page."""
+    result = await page.evaluate(
+        "(sel) => Array.from(new Set(Array.from(document.querySelectorAll(sel))"
+        ".map((a) => a.getAttribute('href')).filter(Boolean)))",
+        _PERMALINK_SELECTOR,
+    )
+    return result if isinstance(result, list) else []
+
+
+async def _await_permalink(
+    page: Any, before: list[str], *, timeout: float = 12.0
+) -> str | None:
+    """Wait for the permalink LinkedIn offers after a successful post.
+
+    LinkedIn confirms a post with a link to it. Diffing against the links
+    present before submitting is what makes the new one identifiable, and
+    matching the href shape rather than the link's wording keeps it working in
+    any locale. Returns ``None`` rather than guessing when more than one new
+    link appears -- the feed loads posts on its own, and a wrong permalink is
+    worse than none.
+    """
+    seen = set(before)
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        fresh = [h for h in await _permalinks(page) if h not in seen]
+        if len(fresh) == 1:
+            href = fresh[0]
+            return (
+                href if href.startswith("http") else f"https://www.linkedin.com{href}"
+            )
+        if len(fresh) > 1:
+            return None
+        await asyncio.sleep(0.5)
+    return None
+
+
+async def _newest_own_post(page: Any, goto: Any) -> str | None:
+    """Fall back to the author's activity page for the post just published.
+
+    Measured 2026-08-30: unlike the permalink page, the recent-activity page
+    does carry ``data-urn`` set to exactly an activity URN on each post, and
+    the newest post is first. Costs one navigation, so it runs only when the
+    confirmation link did not resolve.
+    """
+    try:
+        await goto("https://www.linkedin.com/in/me/recent-activity/all/")
+        await asyncio.sleep(3.0)
+        urn = await page.evaluate(
+            "() => {"
+            + VISIBLE_JS
+            + r"""
+            const el = Array.from(document.querySelectorAll('[data-urn], [data-id]'))
+                .filter(visible)
+                .find((e) => /^urn:li:(activity|ugcPost|share):\d+$/.test(
+                    e.getAttribute('data-urn') || e.getAttribute('data-id') || ''));
+            return el ? (el.getAttribute('data-urn') || el.getAttribute('data-id')) : null;
+            }"""
+        )
+    except Exception:
+        logger.debug("Activity-page fallback failed", exc_info=True)
+        return None
+    if not isinstance(urn, str) or not urn:
+        return None
+    return f"https://www.linkedin.com/feed/update/{urn}/"
+
+
 async def create_post(
     page: Any,
     goto: Any,
@@ -591,6 +738,7 @@ async def create_post(
         await _dismiss_composer(page)
         raise ComposerError("Could not focus the composer text editor.")
 
+    await _mark_editor(page)
     await asyncio.sleep(0.2)
     # Typed rather than pasted: LinkedIn's editor builds its internal model
     # from key events, and a human-plausible cadence costs us nothing here.
@@ -611,13 +759,12 @@ async def create_post(
     if when is not None:
         schedule_info = await _apply_schedule(page, when)
 
+    links_before = await _permalinks(page)
     submit = await _click_by_text(
         page,
         (
             # After Confirm the primary action relabels; accept either.
-            ["exact:schedule", "exact:post"]
-            if when is not None
-            else ["exact:post"]
+            ["exact:schedule", "exact:post"] if when is not None else ["exact:post"]
         ),
         scoped=True,
     )
@@ -630,18 +777,20 @@ async def create_post(
         )
 
     await asyncio.sleep(3.0)
-    still_open = await page.evaluate(
-        """() => {
-            const d = document.querySelector('div[role="dialog"]');
-            return !!(d && (d.offsetWidth || d.offsetHeight
-                            || d.getClientRects().length));
-        }"""
-    )
+    still_open = await _editor_still_open(page)
+
+    # A scheduled post has no permalink to hand back -- LinkedIn is holding it.
+    post_url: str | None = None
+    if when is None:
+        post_url = await _await_permalink(page, links_before)
+        if post_url is None:
+            post_url = await _newest_own_post(page, goto)
 
     return {
         "status": "scheduled" if when is not None else "posted",
         "submitted": True,
         "composer_closed": not still_open,
+        "post_url": post_url,
         "characters": len(body),
         "images_attached": len(images),
         "scheduled_for": when.isoformat(timespec="minutes") if when else None,
