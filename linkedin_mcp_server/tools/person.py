@@ -66,7 +66,12 @@ def register_person_tools(
             Dict with url, sections (name -> raw text), and optional references.
             Sections may be absent if extraction yielded no content for that page.
             Includes unknown_sections list when unrecognised names are passed.
-            The LLM should parse the raw text in each section.
+            With "posts", references["posts"] opens with one {kind: "feed_post",
+            url: "/feed/update/<urn>/", text: <commentary excerpt>, context:
+            "post"} entry per post in page order (newest first) — a permalink,
+            and the exact shape approva_comment accepts — ahead of the
+            author/mention anchors. The LLM should parse the raw text in each
+            section.
         """
         try:
             extractor = extractor or await get_ready_extractor(

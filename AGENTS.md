@@ -145,6 +145,7 @@ Optional additional keys:
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs and get_saved_jobs)
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
+- `references["posts"]` (person `posts` section, get_company_posts) and `references["search_results"]` (search_posts) — open with one `kind: "feed_post"` entry per post card, `url: /feed/update/<urn>/`, in page order, `text` = commentary excerpt (≤80 chars) when found, `context` = `post` / `company post` / `search result`. Read from the card's `data-urn` (these pages render no permalink anchors — verified live 2026-08-30/09-01). Listed before the anchor references so the per-section anchor cap never drops them; own cap 50. The home feed is deliberately excluded from the scan so its SDUI permalinks are not doubled with URN-form twins.
 
 ## Tests
 

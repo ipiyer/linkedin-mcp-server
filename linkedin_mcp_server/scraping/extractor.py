@@ -779,6 +779,90 @@ def _build_feed_references(
     return dedupe_references(refs, cap=50)
 
 
+# Exact post-container ids as LinkedIn stamps them (``data-urn`` / ``data-id``).
+# A comment's id embeds its post's — ``urn:li:comment:(urn:li:activity:7123,456)``
+# — so this must be a full match, never a search, or every comment on the page
+# would read as a post.
+_POST_URN_RE = re.compile(r"^urn:li:(activity|ugcPost|share):\d+$")
+# Same ceiling as ``references["feed"]``: nobody scrolls an activity page past
+# fifty posts, and a runaway DOM must not turn into a runaway payload.
+_POST_URN_CAP = 50
+_POST_LABEL_MAX = 80
+
+
+def _post_label(value: Any) -> str | None:
+    """Compact, single-line label for a post reference, or None if empty.
+
+    Mirrors the shape ``choose_reference_text`` accepts (at most 80 characters,
+    at least one letter or digit) without the anchor-specific candidates.
+    """
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s+", " ", value).strip()
+    if len(text) > _POST_LABEL_MAX:
+        text = text[: _POST_LABEL_MAX - 1].rstrip() + "…"
+    if not any(ch.isalnum() for ch in text):
+        return None
+    return text
+
+
+def _post_urn_references(
+    post_urns: list[Any],
+    context: str,
+) -> list[Reference]:
+    """Turn ``data-urn`` scan results into ``feed_post`` references.
+
+    Activity pages, company posts pages and content search render post cards
+    without a permalink anchor (verified live, 2026-08-30 and 2026-09-01), so
+    the anchor-based reference pipeline cannot see them and a post is
+    addressable only through its author. The URN is in the HTML all the same,
+    as the card's ``data-urn``; ``/feed/update/<urn>/`` is a valid permalink
+    and the exact shape ``approva_comment`` accepts.
+
+    Kept in DOM order, which is the page's order, so the n-th entry is the n-th
+    post in the section text. Deduped on URN; capped like the feed.
+    """
+    refs: list[Reference] = []
+    seen: set[str] = set()
+    for item in post_urns:
+        if not isinstance(item, dict):
+            continue
+        urn = item.get("urn")
+        if not isinstance(urn, str) or not _POST_URN_RE.match(urn):
+            continue
+        if urn in seen:
+            continue
+        seen.add(urn)
+        ref: Reference = {
+            "kind": "feed_post",
+            "url": f"/feed/update/{urn}/",
+            "context": context,
+        }
+        label = _post_label(item.get("text"))
+        if label:
+            ref["text"] = label
+        refs.append(ref)
+        if len(refs) >= _POST_URN_CAP:
+            break
+    return refs
+
+
+def _post_reference_context(path: str) -> str | None:
+    """Which reference context a page's ``data-urn`` posts get, or None to skip.
+
+    None means the page is not one where post cards lack permalink anchors —
+    the DOM scan is not run there, so the home feed's own permalink pipeline
+    (``_build_feed_references``) is never doubled up with URN-form twins.
+    """
+    if "/recent-activity/" in path:
+        return "post"
+    if "/company/" in path and path.rstrip("/").endswith("/posts"):
+        return "company post"
+    if "/search/results/content" in path:
+        return "search result"
+    return None
+
+
 async def _drain_listener_tasks(pending: list[asyncio.Task[None]]) -> None:
     """Bounded teardown for fire-and-forget response listener tasks.
 
@@ -1851,8 +1935,12 @@ class LinkedInExtractor:
             scrolls = max_scrolls if max_scrolls is not None else 5
             await scroll_to_bottom(self._page, pause_time=0.5, max_scrolls=scrolls)
 
-        # Extract text from main content area
-        raw_result = await self._extract_root_content(["main"])
+        # Extract text from main content area. Post cards on these pages carry
+        # no permalink anchor, only a ``data-urn``; scan for it where it applies.
+        post_context = _post_reference_context(path)
+        raw_result = await self._extract_root_content(
+            ["main"], post_urns=post_context is not None
+        )
         raw = raw_result["text"]
 
         if not raw:
@@ -1864,10 +1952,17 @@ class LinkedInExtractor:
             )
             return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
         cleaned = _filter_linkedin_noise_lines(truncated)
-        return ExtractedSection(
-            text=cleaned,
-            references=build_references(raw_result["references"], section_name),
-        )
+        references = build_references(raw_result["references"], section_name)
+        if post_context is not None:
+            # Posts go first so the per-section anchor cap can never push them
+            # out, and so their order matches the section text. Deduped
+            # without a cap: an anchor-derived twin of the same permalink
+            # collapses, everything else is already bounded on its own side.
+            references = dedupe_references(
+                _post_urn_references(raw_result.get("post_urns", []), post_context)
+                + references
+            )
+        return ExtractedSection(text=cleaned, references=references)
 
     async def _extract_overlay(
         self,
@@ -4504,7 +4599,10 @@ class LinkedInExtractor:
             {url, sections: {search_results: text}} plus optional ``references``
             (post authors, companies, linked jobs) and ``section_errors``.
             Verified live: the results page carries no per-post permalink
-            anchors, so a post is addressable only through its author.
+            anchors, but each post card carries its activity URN, so
+            ``references["search_results"]`` opens with one ``feed_post``
+            entry per post (``/feed/update/<urn>/``, page order, commentary
+            excerpt as ``text``) ahead of the author/company anchors.
             The LLM should parse the raw text to extract each post's author,
             headline, body, date, and reaction counts.
         """
@@ -5030,10 +5128,20 @@ class LinkedInExtractor:
     async def _extract_root_content(
         self,
         selectors: list[str],
+        *,
+        post_urns: bool = False,
     ) -> dict[str, Any]:
-        """Extract innerText and raw anchor metadata from the first matching root."""
+        """Extract innerText and raw anchor metadata from the first matching root.
+
+        With ``post_urns`` set, also returns ``post_urns``: one entry per post
+        card under the root, in DOM order, read from the card's ``data-urn``
+        (or ``data-id``) when that is exactly an activity/ugcPost/share URN.
+        Each carries the card's commentary text as ``text`` when a commentary
+        node is found, else an empty string. Off by default because the home
+        feed already surfaces permalinks through its own pipeline.
+        """
         result = await self._page.evaluate(
-            """({ selectors }) => {
+            """({ selectors, postUrns }) => {
                 const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
                 const containerSelector = 'section, article, li, div';
                 const headingSelector = 'h1, h2, h3';
@@ -5130,8 +5238,40 @@ class LinkedInExtractor:
                     })
                     .filter(Boolean);
 
-                return { source, text, references };
+                if (!postUrns) {
+                    return { source, text, references };
+                }
+
+                // Post cards carry their id as data-urn (or data-id). A full
+                // match only: a comment's data-id embeds its post's URN.
+                const POST_URN_RE = /^urn:li:(activity|ugcPost|share):\\d+$/;
+                const MAX_POST_URNS = 50;
+                const commentarySelector = [
+                    '.update-components-text',
+                    '.feed-shared-update-v2__description',
+                    '.feed-shared-text',
+                ].join(', ');
+                const seenUrns = new Set();
+                const posts = [];
+                for (const node of container.querySelectorAll('[data-urn], [data-id]')) {
+                    const urn = node.getAttribute('data-urn') || node.getAttribute('data-id') || '';
+                    if (!POST_URN_RE.test(urn) || seenUrns.has(urn)) {
+                        continue;
+                    }
+                    seenUrns.add(urn);
+                    const commentary = node.querySelector(commentarySelector);
+                    posts.push({
+                        urn,
+                        text: normalize(commentary?.innerText || commentary?.textContent),
+                        in_article: Boolean(node.closest('article')),
+                    });
+                    if (posts.length >= MAX_POST_URNS) {
+                        break;
+                    }
+                }
+
+                return { source, text, references, post_urns: posts };
             }""",
-            {"selectors": selectors},
+            {"selectors": selectors, "postUrns": post_urns},
         )
         return result

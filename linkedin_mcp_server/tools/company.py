@@ -123,7 +123,11 @@ def register_company_tools(
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
-            The LLM should parse the raw text to extract individual posts.
+            references["posts"] opens with one {kind: "feed_post", url:
+            "/feed/update/<urn>/", text: <commentary excerpt>, context:
+            "company post"} entry per post in page order — a permalink, and
+            the exact shape approva_comment accepts. The LLM should parse the
+            raw text to extract individual posts.
         """
         try:
             extractor = extractor or await get_ready_extractor(

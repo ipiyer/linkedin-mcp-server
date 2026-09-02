@@ -66,11 +66,14 @@ def register_post_tools(
 
         Returns:
             Dict with url, sections (search_results -> raw text), and optional
-            references (post authors, companies, linked jobs) and
-            section_errors. The results page carries no per-post permalinks,
-            so reach a post through its author. The LLM should parse the raw
+            references and section_errors. references["search_results"]
+            opens with one {kind: "feed_post", url: "/feed/update/<urn>/",
+            text: <commentary excerpt>} entry per post, in page order, ahead
+            of the author/company anchors; the url is a permalink and the
+            exact shape approva_comment accepts. The LLM should parse the raw
             text to extract each post's author, headline/role, company, body,
-            posted date, and reaction/comment counts.
+            posted date, and reaction/comment counts, and match a post to its
+            reference by position or excerpt.
         """
         try:
             extractor = extractor or await get_ready_extractor(

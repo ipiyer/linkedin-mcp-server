@@ -8419,3 +8419,227 @@ class TestEveryNormalizedEntryPoint:
                 await getattr(extractor, method)(*args, **kwargs)
         mock_extract.assert_not_called()
         mock_navigate.assert_not_called()
+
+
+class TestPostUrnReferences:
+    """Tests for the ``data-urn`` → ``feed_post`` reference bridge."""
+
+    def test_builds_a_permalink_reference_per_post_in_order(self):
+        refs = extractor_module._post_urn_references(
+            [
+                {"urn": "urn:li:activity:7111", "text": "Erster  Beitrag"},
+                {"urn": "urn:li:ugcPost:7222", "text": ""},
+            ],
+            "post",
+        )
+        assert refs == [
+            {
+                "kind": "feed_post",
+                "url": "/feed/update/urn:li:activity:7111/",
+                "context": "post",
+                "text": "Erster Beitrag",
+            },
+            {
+                "kind": "feed_post",
+                "url": "/feed/update/urn:li:ugcPost:7222/",
+                "context": "post",
+            },
+        ]
+
+    def test_rejects_anything_that_is_not_exactly_a_post_urn(self):
+        refs = extractor_module._post_urn_references(
+            [
+                {"urn": "urn:li:comment:(urn:li:activity:7111,9)"},
+                {"urn": "urn:li:activity:"},
+                {"urn": "xurn:li:activity:7111"},
+                {"urn": 7111},
+                "urn:li:activity:7111",
+                {"text": "no urn"},
+            ],
+            "post",
+        )
+        assert refs == []
+
+    def test_dedupes_on_urn_and_caps_at_fifty(self):
+        items = [{"urn": f"urn:li:activity:{n}"} for n in range(60)]
+        items.insert(1, {"urn": "urn:li:activity:0"})
+        refs = extractor_module._post_urn_references(items, "post")
+        assert len(refs) == 50
+        assert refs[0]["url"] == "/feed/update/urn:li:activity:0/"
+        assert refs[1]["url"] == "/feed/update/urn:li:activity:1/"
+        assert refs[-1]["url"] == "/feed/update/urn:li:activity:49/"
+
+    def test_label_is_truncated_and_symbol_only_text_is_dropped(self):
+        long = "a" * 100
+        refs = extractor_module._post_urn_references(
+            [
+                {"urn": "urn:li:activity:1", "text": long},
+                {"urn": "urn:li:activity:2", "text": "…  — !!"},
+                {"urn": "urn:li:activity:3", "text": None},
+            ],
+            "post",
+        )
+        assert len(refs[0]["text"]) == 80
+        assert refs[0]["text"].endswith("…")
+        assert "text" not in refs[1]
+        assert "text" not in refs[2]
+
+
+class TestPostReferenceContext:
+    def test_pages_without_permalink_anchors_get_a_context(self):
+        ctx = extractor_module._post_reference_context
+        assert ctx("/in/someone/recent-activity/all/") == "post"
+        assert ctx("/company/acme/posts/") == "company post"
+        assert ctx("/company/acme/posts") == "company post"
+        assert ctx("/search/results/content/") == "search result"
+
+    def test_other_pages_are_left_to_the_anchor_pipeline(self):
+        ctx = extractor_module._post_reference_context
+        assert ctx("/feed/") is None
+        assert ctx("/in/someone/") is None
+        assert ctx("/in/someone/details/experience/") is None
+        assert ctx("/company/acme/") is None
+        assert ctx("/company/acme/people/") is None
+        assert ctx("/search/results/people/") is None
+
+
+class TestExtractPageOncePostUrns:
+    """The scan runs only where post cards lack anchors, and posts lead."""
+
+    def _patches(self):
+        return (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        )
+
+    async def test_activity_page_asks_for_urns_and_lists_posts_first(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Post content " * 50,
+                "references": [
+                    {
+                        "href": "https://www.linkedin.com/in/raghureddy2025/",
+                        "text": "Raghu Reddy",
+                    }
+                ],
+                "post_urns": [
+                    {"urn": "urn:li:activity:7500732527914037248", "text": "Pricing"},
+                    {"urn": "urn:li:activity:7498158931869904896", "text": "Rates"},
+                ],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock()
+        extractor = LinkedInExtractor(mock_page)
+        with self._patches()[0], self._patches()[1], self._patches()[2]:
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/in/raghureddy2025/recent-activity/all/",
+                section_name="posts",
+            )
+
+        await_args = mock_page.evaluate.await_args
+        assert await_args is not None
+        _, evaluate_args = await_args.args
+        assert evaluate_args["postUrns"] is True
+        assert [r["kind"] for r in result.references] == [
+            "feed_post",
+            "feed_post",
+            "person",
+        ]
+        assert result.references[0] == {
+            "kind": "feed_post",
+            "url": "/feed/update/urn:li:activity:7500732527914037248/",
+            "context": "post",
+            "text": "Pricing",
+        }
+
+    async def test_content_search_gets_search_result_context(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Result content " * 20,
+                "references": [],
+                "post_urns": [{"urn": "urn:li:activity:1", "text": "Treffer"}],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock()
+        extractor = LinkedInExtractor(mock_page)
+        with self._patches()[0], self._patches()[1], self._patches()[2]:
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/search/results/content/?keywords=x",
+                section_name="search_results",
+            )
+
+        assert result.references == [
+            {
+                "kind": "feed_post",
+                "url": "/feed/update/urn:li:activity:1/",
+                "context": "search result",
+                "text": "Treffer",
+            }
+        ]
+
+    async def test_an_anchor_twin_of_the_same_permalink_collapses(self, mock_page):
+        # A company posts page can carry both a card data-urn and a permalink
+        # anchor for the same post; one reference, the richer label kept.
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Post content " * 50,
+                "references": [
+                    {
+                        "href": "https://www.linkedin.com/feed/update/urn:li:activity:5/",
+                        "text": "Original company post",
+                    }
+                ],
+                "post_urns": [{"urn": "urn:li:activity:5", "text": ""}],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock()
+        extractor = LinkedInExtractor(mock_page)
+        with self._patches()[0], self._patches()[1], self._patches()[2]:
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/company/acme/posts/",
+                section_name="posts",
+            )
+
+        assert len(result.references) == 1
+        assert result.references[0]["url"] == "/feed/update/urn:li:activity:5/"
+        assert result.references[0]["context"] == "company post"
+        assert result.references[0]["text"] == "Original company post"
+
+    async def test_profile_pages_do_not_run_the_scan(self, mock_page):
+        # The evaluate payload has no post_urns key on these pages, and the
+        # anchor references come back exactly as before.
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Sample profile text",
+                "references": [
+                    {"href": "https://www.linkedin.com/in/someone/", "text": "Someone"}
+                ],
+            }
+        )
+        extractor = LinkedInExtractor(mock_page)
+        with self._patches()[0], self._patches()[1], self._patches()[2]:
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/in/someone/",
+                section_name="main_profile",
+            )
+
+        await_args = mock_page.evaluate.await_args
+        assert await_args is not None
+        _, evaluate_args = await_args.args
+        assert evaluate_args["postUrns"] is False
+        assert [r["kind"] for r in result.references] == ["person"]
